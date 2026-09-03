@@ -1,0 +1,230 @@
+// Modelo de dominio inicial — ver "Informe Técnico draft Mauriji ft Elniki", Pestaña 2
+// (Modelo de Atributos) para el detalle de cada decisión.
+//
+// Convenciones (según el informe):
+// - PK: uuid en todas las tablas (gen_random_uuid(), extensión pgcrypto).
+// - "Enums": varchar + CHECK constraint en vez de enum nativo de Postgres,
+//   para poder agregar/quitar valores sin ALTER TYPE. Los CHECK constraints
+//   se agregan en una migración SQL aparte (ver prisma/migrations, migración
+//   `add_check_constraints`), porque Prisma no los declara en el schema.
+// - Auditoría base: fecha_creacion / fecha_actualizacion en tablas transaccionales.
+// - Borrado lógico: columna `activo` en vez de eliminar filas con integridad
+//   referencial (Usuario, Comercio, Sucursal, Producto, EmpleadoSucursal).
+// - Offline-first (sucursales sin conexión) queda como decisión abierta del
+//   informe: no se agregan campos de sincronización todavía.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// La connection string ya no se declara acá desde Prisma 7: vive en
+// prisma.config.ts (para el CLI) y se pasa vía driver adapter a
+// PrismaClient en tiempo de ejecución (ver src/prisma/prisma.service.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Actores organizacionales
+// ---------------------------------------------------------------------------
+
+model Usuario {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  nombre            String    @db.VarChar(100)
+  email             String    @unique @db.VarChar(150)
+  passwordHash      String    @map("password_hash") @db.VarChar(255)
+  telefono          String?   @db.VarChar(30)
+  fechaNacimiento   DateTime? @map("fecha_nacimiento") @db.Date
+  activo            Boolean   @default(true)
+  fechaCreacion     DateTime  @default(now()) @map("fecha_creacion")
+  fechaActualizacion DateTime @updatedAt @map("fecha_actualizacion")
+
+  comercios          Comercio[]
+  empleadoSucursales EmpleadoSucursal[]
+
+  @@map("usuario")
+}
+
+model Comercio {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  usuarioId            String   @map("usuario_id") @db.Uuid
+  razonSocial          String   @map("razon_social") @db.VarChar(150)
+  nombreComercial      String   @map("nombre_comercial") @db.VarChar(150)
+  identificadorFiscal  String   @unique @map("identificador_fiscal") @db.VarChar(20)
+  activo               Boolean  @default(true)
+  fechaCreacion        DateTime @default(now()) @map("fecha_creacion")
+  fechaActualizacion   DateTime @updatedAt @map("fecha_actualizacion")
+
+  usuario    Usuario     @relation(fields: [usuarioId], references: [id])
+  sucursales Sucursal[]
+
+  @@map("comercio")
+}
+
+model Sucursal {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  comercioId         String   @map("comercio_id") @db.Uuid
+  nombre             String   @db.VarChar(150)
+  direccion          String   @db.VarChar(255)
+  latitud            Decimal? @db.Decimal(9, 6)
+  longitud           Decimal? @db.Decimal(9, 6)
+  telefono           String?  @db.VarChar(30)
+  horario            Json?
+  activo             Boolean  @default(true)
+  fechaCreacion      DateTime @default(now()) @map("fecha_creacion")
+  fechaActualizacion DateTime @updatedAt @map("fecha_actualizacion")
+
+  comercio           Comercio           @relation(fields: [comercioId], references: [id])
+  empleadoSucursales EmpleadoSucursal[]
+  productos          Producto[]
+  comandas           Comanda[]
+
+  @@map("sucursal")
+}
+
+model EmpleadoSucursal {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  usuarioId     String    @map("usuario_id") @db.Uuid
+  sucursalId    String    @map("sucursal_id") @db.Uuid
+  // Rol dentro de la sucursal: define permisos (mozo, cocina, gerencia, admin).
+  // No está en la tabla de atributos del informe pero es necesario para
+  // autorización vía JWT; revisar junto con Mauricio antes de cerrarlo.
+  rol           String    @db.VarChar(30)
+  fechaIngreso  DateTime  @map("fecha_ingreso") @db.Date
+  fechaEgreso   DateTime? @map("fecha_egreso") @db.Date
+  activo        Boolean   @default(true)
+  fechaCreacion DateTime  @default(now()) @map("fecha_creacion")
+
+  usuario  Usuario @relation(fields: [usuarioId], references: [id])
+  sucursal Sucursal @relation(fields: [sucursalId], references: [id])
+
+  comandasGeneradas         Comanda[]
+  historialComanda          HistorialComanda[]
+  historialDetalleComanda   HistorialDetalleComanda[]
+
+  // Índice único parcial (usuario_id, sucursal_id) WHERE activo = true
+  // se agrega en la migración SQL — Prisma no soporta índices parciales
+  // en el schema declarativo.
+  @@map("empleado_sucursal")
+}
+
+// ---------------------------------------------------------------------------
+// Catálogo
+// ---------------------------------------------------------------------------
+
+model Producto {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sucursalId         String   @map("sucursal_id") @db.Uuid
+  nombre             String   @db.VarChar(150)
+  descripcion        String?
+  precio             Decimal  @db.Decimal(10, 2)
+  categoria          String   @db.VarChar(100)
+  imagenUrl          String?  @map("imagen_url") @db.VarChar(255)
+  // disponible = "hoy no hay stock" (distinto de `activo`, que es borrado lógico)
+  disponible         Boolean  @default(true)
+  activo             Boolean  @default(true)
+  fechaCreacion      DateTime @default(now()) @map("fecha_creacion")
+  fechaActualizacion DateTime @updatedAt @map("fecha_actualizacion")
+
+  sucursal         Sucursal          @relation(fields: [sucursalId], references: [id])
+  detallesComanda  DetalleComanda[]
+
+  @@map("producto")
+}
+
+// ---------------------------------------------------------------------------
+// Núcleo transaccional
+// ---------------------------------------------------------------------------
+
+model Comanda {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sucursalId         String    @map("sucursal_id") @db.Uuid
+  empleadoSucursalId String    @map("empleado_sucursal_id") @db.Uuid
+  mesa               String    @db.VarChar(20)
+  // CHECK (estado IN ('abierta','en_preparacion','servida','cerrada','cancelada'))
+  estado             String    @default("abierta") @db.VarChar(20)
+  observaciones      String?
+  total              Decimal   @default(0) @db.Decimal(10, 2)
+  fechaApertura      DateTime  @default(now()) @map("fecha_apertura")
+  fechaCierre        DateTime? @map("fecha_cierre")
+
+  sucursal         Sucursal           @relation(fields: [sucursalId], references: [id])
+  empleadoSucursal EmpleadoSucursal   @relation(fields: [empleadoSucursalId], references: [id])
+  detalles         DetalleComanda[]
+  pagos            Pago[]
+  historial        HistorialComanda[]
+
+  @@index([sucursalId, estado])
+  @@map("comanda")
+}
+
+model DetalleComanda {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  comandaId          String   @map("comanda_id") @db.Uuid
+  productoId         String   @map("producto_id") @db.Uuid
+  cantidad           Int
+  precioUnitario     Decimal  @map("precio_unitario") @db.Decimal(10, 2)
+  subtotal           Decimal  @db.Decimal(10, 2)
+  // CHECK (estado IN ('pendiente','en_preparacion','listo','entregado','cancelado'))
+  // Informativo (ej. pantalla de cocina); no gobierna el estado de la Comanda.
+  estado             String   @default("pendiente") @db.VarChar(20)
+  observaciones      String?
+  fechaCreacion      DateTime @default(now()) @map("fecha_creacion")
+  fechaActualizacion DateTime @updatedAt @map("fecha_actualizacion")
+
+  comanda   Comanda                   @relation(fields: [comandaId], references: [id])
+  producto  Producto                  @relation(fields: [productoId], references: [id])
+  historial HistorialDetalleComanda[]
+
+  @@index([comandaId])
+  @@map("detalle_comanda")
+}
+
+model Pago {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  comandaId          String   @map("comanda_id") @db.Uuid
+  // CHECK (metodo_pago IN ('efectivo','tarjeta_debito','tarjeta_credito','transferencia','billetera_virtual'))
+  metodoPago         String   @map("metodo_pago") @db.VarChar(30)
+  monto              Decimal  @db.Decimal(10, 2)
+  referenciaExterna  String?  @map("referencia_externa") @db.VarChar(100)
+  // CHECK (estado IN ('pendiente','aprobado','rechazado','reembolsado'))
+  estado             String   @default("pendiente") @db.VarChar(20)
+  fechaPago          DateTime @default(now()) @map("fecha_pago")
+
+  comanda Comanda @relation(fields: [comandaId], references: [id])
+
+  @@index([comandaId])
+  @@map("pago")
+}
+
+// ---------------------------------------------------------------------------
+// Auditoría
+// ---------------------------------------------------------------------------
+
+model HistorialComanda {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  comandaId          String   @map("comanda_id") @db.Uuid
+  // { "campo": "estado", "valor_anterior": "abierta", "valor_nuevo": "cerrada" }
+  cambio             Json
+  empleadoSucursalId String   @map("empleado_sucursal_id") @db.Uuid
+  fechaModificacion  DateTime @default(now()) @map("fecha_modificacion")
+
+  comanda          Comanda          @relation(fields: [comandaId], references: [id])
+  empleadoSucursal EmpleadoSucursal @relation(fields: [empleadoSucursalId], references: [id])
+
+  @@index([comandaId, fechaModificacion])
+  @@map("historial_comanda")
+}
+
+model HistorialDetalleComanda {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  detalleComandaId   String   @map("detalle_comanda_id") @db.Uuid
+  cambio             Json
+  empleadoSucursalId String   @map("empleado_sucursal_id") @db.Uuid
+  fechaModificacion  DateTime @default(now()) @map("fecha_modificacion")
+
+  detalleComanda   DetalleComanda   @relation(fields: [detalleComandaId], references: [id])
+  empleadoSucursal EmpleadoSucursal @relation(fields: [empleadoSucursalId], references: [id])
+
+  @@map("historial_detalle_comanda")
+}
